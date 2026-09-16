@@ -37,10 +37,41 @@ def required_env(name: str) -> str:
 TELEGRAM_BOT_TOKEN = required_env("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = int(required_env("TELEGRAM_CHAT_ID"))
 
+
+def parse_allowed_user_ids(raw: str) -> set[int]:
+    ids: set[int] = set()
+    for item in raw.replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            ids.add(int(item))
+        except ValueError as exc:
+            raise RuntimeError(
+                "TELEGRAM_ALLOWED_USER_IDS должен содержать Telegram ID через запятую"
+            ) from exc
+    if not ids:
+        raise RuntimeError("Не заполнена обязательная переменная TELEGRAM_ALLOWED_USER_IDS")
+    return ids
+
+
+TELEGRAM_ALLOWED_USER_IDS = parse_allowed_user_ids(
+    required_env("TELEGRAM_ALLOWED_USER_IDS")
+)
+
 CABINETS = [
     WildberriesClient(required_env("WB_TOKEN_1"), required_env("WB_NAME_1")),
     WildberriesClient(required_env("WB_TOKEN_2"), required_env("WB_NAME_2")),
 ]
+
+
+def format_money(value) -> str:
+    # 12 345,67 ₽; whole rubles are shown without kopecks.
+    value = value.quantize(__import__("decimal").Decimal("0.01"))
+    if value == value.to_integral():
+        return f"{int(value):,}".replace(",", " ") + " ₽"
+    rubles = f"{value:,.2f}".replace(",", " ").replace(".", ",")
+    return rubles + " ₽"
 
 
 def format_report(cabinet_name: str, report: DailyReport) -> str:
@@ -50,7 +81,9 @@ def format_report(cabinet_name: str, report: DailyReport) -> str:
         f"Кабинет: <b>{html.escape(cabinet_name)}</b>",
         "",
         f"Заказано итого: <b>{report.ordered_total} шт.</b>",
+        f"Сумма заказов: <b>{format_money(report.ordered_sum)}</b>",
         f"Выкуплено итого: <b>{report.bought_total} шт.</b>",
+        f"Сумма выкупов: <b>{format_money(report.bought_sum)}</b>",
     ]
 
     if report.orders_by_article:
@@ -101,11 +134,23 @@ async def send_all_reports(application: Application) -> None:
 
 
 def is_authorized(update: Update) -> bool:
-    return bool(update.effective_chat and update.effective_chat.id == TELEGRAM_CHAT_ID)
+    """Allow bot commands only for Telegram users from the whitelist."""
+    return bool(
+        update.effective_user
+        and update.effective_user.id in TELEGRAM_ALLOWED_USER_IDS
+    )
+
+
+async def deny_access(update: Update) -> None:
+    user_id = update.effective_user.id if update.effective_user else "unknown"
+    log.warning("Unauthorized Telegram access attempt. user_id=%s", user_id)
+    if update.effective_message:
+        await update.effective_message.reply_text("⛔ Доступ к боту запрещён.")
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
+        await deny_access(update)
         return
     await update.effective_message.reply_text(
         "Бот активен.\n\n"
@@ -116,6 +161,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update):
+        await deny_access(update)
         return
     await update.effective_message.reply_text("Формирую отчёт за текущие сутки…")
     await send_all_reports(context.application)

@@ -5,6 +5,7 @@ import logging
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -24,7 +25,9 @@ class WildberriesAPIError(RuntimeError):
 @dataclass(slots=True)
 class DailyReport:
     ordered_total: int
+    ordered_sum: Decimal
     bought_total: int
+    bought_sum: Decimal
     orders_by_article: dict[str, int]
 
 
@@ -70,6 +73,25 @@ class WildberriesClient:
             # WB Statistics API documents date/time for these methods in Moscow time.
             dt = dt.replace(tzinfo=MOSCOW_TZ)
         return dt.astimezone(MOSCOW_TZ)
+
+
+    @staticmethod
+    def _row_amount(row: dict[str, Any]) -> Decimal:
+        """Return the closest-to-buyer amount available in WB Statistics API.
+
+        finishedPrice is preferred because it reflects the final retail price.
+        Older/partial rows may not contain it, so fall back to priceWithDisc
+        and then totalPrice.
+        """
+        for field in ("finishedPrice", "priceWithDisc", "totalPrice"):
+            value = row.get(field)
+            if value in (None, ""):
+                continue
+            try:
+                return Decimal(str(value).replace(",", "."))
+            except (InvalidOperation, ValueError):
+                continue
+        return Decimal("0")
 
     async def _get_day_rows(self, kind: str, *, force: bool = False) -> list[dict[str, Any]]:
         if kind not in {"orders", "sales"}:
@@ -137,6 +159,7 @@ class WildberriesClient:
         order_seen: set[str] = set()
         orders_by_article: Counter[str] = Counter()
         ordered_total = 0
+        ordered_sum = Decimal("0")
 
         for index, row in enumerate(orders_rows):
             dt = self._parse_wb_dt(str(row.get("date") or ""))
@@ -151,11 +174,13 @@ class WildberriesClient:
 
             article = str(row.get("supplierArticle") or "Без артикула").strip() or "Без артикула"
             ordered_total += 1
+            ordered_sum += self._row_amount(row)
             orders_by_article[article] += 1
 
         # Sales endpoint contains both sales and returns. Real sales use saleID starting with S.
         sale_seen: set[str] = set()
         bought_total = 0
+        bought_sum = Decimal("0")
         for index, row in enumerate(sales_rows):
             dt = self._parse_wb_dt(str(row.get("date") or ""))
             if dt is not None and dt.date() != today:
@@ -170,9 +195,12 @@ class WildberriesClient:
                 continue
             sale_seen.add(unique_key)
             bought_total += 1
+            bought_sum += self._row_amount(row)
 
         return DailyReport(
             ordered_total=ordered_total,
+            ordered_sum=ordered_sum,
             bought_total=bought_total,
+            bought_sum=bought_sum,
             orders_by_article=dict(orders_by_article),
         )
