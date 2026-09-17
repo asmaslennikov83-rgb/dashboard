@@ -25,6 +25,8 @@ class WildberriesAPIError(RuntimeError):
 @dataclass(slots=True)
 class DailyReport:
     ordered_total: int
+    ordered_fbo: int
+    ordered_fbs: int
     ordered_sum: Decimal
     bought_total: int
     bought_sum: Decimal
@@ -159,6 +161,8 @@ class WildberriesClient:
         order_seen: set[str] = set()
         orders_by_article: Counter[str] = Counter()
         ordered_total = 0
+        ordered_fbo = 0
+        ordered_fbs = 0
         ordered_sum = Decimal("0")
 
         for index, row in enumerate(orders_rows):
@@ -174,6 +178,15 @@ class WildberriesClient:
 
             article = str(row.get("supplierArticle") or "Без артикула").strip() or "Без артикула"
             ordered_total += 1
+
+            # WB Statistics API returns warehouseType for the sales model:
+            # "Склад WB" = FBO, "Склад продавца" = FBS.
+            warehouse_type = str(row.get("warehouseType") or "").strip().casefold()
+            if warehouse_type in {"склад wb", "wb warehouse"}:
+                ordered_fbo += 1
+            elif warehouse_type in {"склад продавца", "seller warehouse", "seller's warehouse"}:
+                ordered_fbs += 1
+
             ordered_sum += self._row_amount(row)
             orders_by_article[article] += 1
 
@@ -199,6 +212,8 @@ class WildberriesClient:
 
         return DailyReport(
             ordered_total=ordered_total,
+            ordered_fbo=ordered_fbo,
+            ordered_fbs=ordered_fbs,
             ordered_sum=ordered_sum,
             bought_total=bought_total,
             bought_sum=bought_sum,
