@@ -41,7 +41,6 @@ def required_env(name: str) -> str:
 
 
 TELEGRAM_BOT_TOKEN = required_env("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = int(required_env("TELEGRAM_CHAT_ID"))
 
 
 def parse_allowed_user_ids(raw: str) -> set[int]:
@@ -176,8 +175,13 @@ def is_within_activity_window(now: datetime | None = None) -> bool:
     return hour >= start or hour <= end
 
 
-async def send_all_reports(application: Application, *, force: bool = False) -> None:
-    """Send one independent Telegram message for each WB cabinet."""
+async def send_all_reports(
+    application: Application,
+    *,
+    force: bool = False,
+    recipient_ids: list[int] | None = None,
+) -> None:
+    """Send one independent message per WB cabinet to each recipient."""
     if not force and not is_within_activity_window():
         now = datetime.now(MOSCOW_TZ)
         log.info(
@@ -188,36 +192,42 @@ async def send_all_reports(application: Application, *, force: bool = False) -> 
         )
         return
 
+    # Automatic reports go to every user in the Telegram whitelist.
+    targets = recipient_ids if recipient_ids is not None else sorted(TELEGRAM_ALLOWED_USER_IDS)
+
     for cabinet in CABINETS:
         try:
             report = await cabinet.build_daily_report()
-            await application.bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=format_report(cabinet.name, report),
-                parse_mode=ParseMode.HTML,
-            )
+            text = format_report(cabinet.name, report)
         except WildberriesAPIError as exc:
             log.exception("WB API error for cabinet %s", cabinet.name)
-            await application.bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=(
-                    f"⚠️ <b>Не удалось получить отчёт</b>\n"
-                    f"Кабинет: <b>{html.escape(cabinet.name)}</b>\n"
-                    f"{html.escape(str(exc))}"
-                ),
-                parse_mode=ParseMode.HTML,
+            text = (
+                f"⚠️ <b>Не удалось получить отчёт</b>\n"
+                f"Кабинет: <b>{html.escape(cabinet.name)}</b>\n"
+                f"{html.escape(str(exc))}"
             )
         except Exception as exc:
             log.exception("Unexpected error for cabinet %s", cabinet.name)
-            await application.bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=(
-                    f"⚠️ <b>Ошибка отчёта</b>\n"
-                    f"Кабинет: <b>{html.escape(cabinet.name)}</b>\n"
-                    f"{html.escape(type(exc).__name__)}: {html.escape(str(exc))}"
-                ),
-                parse_mode=ParseMode.HTML,
+            text = (
+                f"⚠️ <b>Ошибка отчёта</b>\n"
+                f"Кабинет: <b>{html.escape(cabinet.name)}</b>\n"
+                f"{html.escape(type(exc).__name__)}: {html.escape(str(exc))}"
             )
+
+        for chat_id in targets:
+            try:
+                await application.bot.send_message(
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                # One unavailable/blocked user must not prevent reports to the others.
+                log.exception(
+                    "Failed to send cabinet %s report to Telegram ID %s",
+                    cabinet.name,
+                    chat_id,
+                )
 
 
 def is_authorized(update: Update) -> bool:
@@ -253,7 +263,11 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await deny_access(update)
         return
     await update.effective_message.reply_text("Формирую отчёт за текущие сутки…")
-    await send_all_reports(context.application, force=True)
+    await send_all_reports(
+        context.application,
+        force=True,
+        recipient_ids=[update.effective_chat.id],
+    )
 
 
 async def activity_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
