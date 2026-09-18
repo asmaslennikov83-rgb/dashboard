@@ -31,6 +31,8 @@ MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 SETTINGS_FILE = Path(os.getenv("SETTINGS_FILE", "activity_settings.json"))
 DEFAULT_ACTIVITY_START = 0
 DEFAULT_ACTIVITY_END = 23
+DEFAULT_ORDER_SUM_FIELD = "finishedPrice"
+ORDER_SUM_FIELDS = ("finishedPrice", "priceWithDisc", "totalPrice")
 
 
 def required_env(name: str) -> str:
@@ -70,27 +72,41 @@ CABINETS = [
 ]
 
 
-def load_activity_settings() -> dict[str, int]:
+def load_settings() -> dict[str, int | str]:
+    defaults: dict[str, int | str] = {
+        "start": DEFAULT_ACTIVITY_START,
+        "end": DEFAULT_ACTIVITY_END,
+        "order_sum_field": DEFAULT_ORDER_SUM_FIELD,
+    }
     if not SETTINGS_FILE.exists():
-        return {"start": DEFAULT_ACTIVITY_START, "end": DEFAULT_ACTIVITY_END}
+        return defaults.copy()
     try:
         data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         start = int(data.get("start", DEFAULT_ACTIVITY_START))
         end = int(data.get("end", DEFAULT_ACTIVITY_END))
-        if 0 <= start <= 23 and 0 <= end <= 23:
-            return {"start": start, "end": end}
+        order_sum_field = str(data.get("order_sum_field", DEFAULT_ORDER_SUM_FIELD))
+        if not (0 <= start <= 23 and 0 <= end <= 23):
+            raise ValueError("invalid activity window")
+        if order_sum_field not in ORDER_SUM_FIELDS:
+            order_sum_field = DEFAULT_ORDER_SUM_FIELD
+        return {
+            "start": start,
+            "end": end,
+            "order_sum_field": order_sum_field,
+        }
     except Exception:
-        log.exception("Failed to read %s; using default activity window", SETTINGS_FILE)
-    return {"start": DEFAULT_ACTIVITY_START, "end": DEFAULT_ACTIVITY_END}
+        log.exception("Failed to read %s; using default settings", SETTINGS_FILE)
+        return defaults.copy()
 
 
-def save_activity_settings(settings: dict[str, int]) -> None:
+def save_settings(settings: dict[str, int | str]) -> None:
     SETTINGS_FILE.write_text(
         json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
 
-ACTIVITY = load_activity_settings()
+SETTINGS = load_settings()
+ACTIVITY = SETTINGS  # Backward-compatible alias used by activity-window functions.
 
 
 def format_money(value: Decimal) -> str:
@@ -153,6 +169,25 @@ def activity_menu() -> InlineKeyboardMarkup:
     )
 
 
+def sumprice_text() -> str:
+    return (
+        "<b>Способ расчёта суммы заказов</b>\n\n"
+        f"Сейчас: <b>{html.escape(str(SETTINGS['order_sum_field']))}</b>\n\n"
+        "Выберите поле WB, по которому бот будет складывать стоимость всех заказов за текущие сутки."
+    )
+
+
+def sumprice_menu() -> InlineKeyboardMarkup:
+    current = str(SETTINGS["order_sum_field"])
+    rows = []
+    for field in ORDER_SUM_FIELDS:
+        prefix = "✅ " if field == current else ""
+        rows.append(
+            [InlineKeyboardButton(f"{prefix}{field}", callback_data=f"sumprice:set:{field}")]
+        )
+    return InlineKeyboardMarkup(rows)
+
+
 def hour_keyboard(field: str) -> InlineKeyboardMarkup:
     rows = []
     for start in range(0, 24, 4):
@@ -200,7 +235,7 @@ async def send_all_reports(
 
     for cabinet in CABINETS:
         try:
-            report = await cabinet.build_daily_report()
+            report = await cabinet.build_daily_report(str(SETTINGS["order_sum_field"]))
             text = format_report(cabinet.name, report)
         except WildberriesAPIError as exc:
             log.exception("WB API error for cabinet %s", cabinet.name)
@@ -257,7 +292,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Бот активен.\n\n"
         "Каждый час он отправляет накопительный отчёт за текущие сутки по двум кабинетам.\n"
         "/report — получить отчёт вручную.\n"
-        "/activity — настроить время автоматической отправки по Москве."
+        "/activity — настроить время автоматической отправки по Москве.\n"
+        "/sumprice — выбрать способ расчёта суммы заказов."
     )
 
 
@@ -279,6 +315,43 @@ async def activity_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     await update.effective_message.reply_text(
         activity_text(), parse_mode=ParseMode.HTML, reply_markup=activity_menu()
+    )
+
+
+async def sumprice_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update):
+        await deny_access(update)
+        return
+    await update.effective_message.reply_text(
+        sumprice_text(), parse_mode=ParseMode.HTML, reply_markup=sumprice_menu()
+    )
+
+
+async def sumprice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update):
+        await deny_access(update)
+        return
+
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    if not data.startswith("sumprice:set:"):
+        return
+
+    field = data.split(":", 2)[-1]
+    if field not in ORDER_SUM_FIELDS:
+        await query.answer("Неизвестный вариант", show_alert=True)
+        return
+
+    SETTINGS["order_sum_field"] = field
+    save_settings(SETTINGS)
+    log.info(
+        "Order sum field changed by Telegram user %s: %s",
+        update.effective_user.id,
+        field,
+    )
+    await query.edit_message_text(
+        sumprice_text(), parse_mode=ParseMode.HTML, reply_markup=sumprice_menu()
     )
 
 
@@ -319,7 +392,7 @@ async def activity_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             return
 
         ACTIVITY[field] = hour
-        save_activity_settings(ACTIVITY)
+        save_settings(SETTINGS)
         log.info(
             "Activity window changed by Telegram user %s: %02d:00-%02d:00",
             update.effective_user.id,
@@ -340,6 +413,7 @@ async def post_init(application: Application) -> None:
         [
             BotCommand("report", "Отчёт за текущие сутки"),
             BotCommand("activity", "Время активности отчётов"),
+            BotCommand("sumprice", "Расчёт суммы заказов"),
             BotCommand("start", "Справка"),
         ]
     )
@@ -383,7 +457,9 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("report", report_command))
     application.add_handler(CommandHandler("activity", activity_command))
+    application.add_handler(CommandHandler("sumprice", sumprice_command))
     application.add_handler(CallbackQueryHandler(activity_callback, pattern=r"^activity:"))
+    application.add_handler(CallbackQueryHandler(sumprice_callback, pattern=r"^sumprice:"))
     application.add_error_handler(error_handler)
     application.run_polling(drop_pending_updates=True)
 

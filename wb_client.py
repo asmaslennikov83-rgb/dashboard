@@ -78,21 +78,22 @@ class WildberriesClient:
 
 
     @staticmethod
-    def _row_amount(row: dict[str, Any]) -> Decimal:
-        """Return the closest-to-buyer amount available in WB Statistics API.
+    def _decimal_field(row: dict[str, Any], field: str) -> Decimal:
+        """Read one numeric WB field without silently substituting another field."""
+        value = row.get(field)
+        if value in (None, ""):
+            return Decimal("0")
+        try:
+            return Decimal(str(value).replace(",", "."))
+        except (InvalidOperation, ValueError):
+            return Decimal("0")
 
-        finishedPrice is preferred because it reflects the final retail price.
-        Older/partial rows may not contain it, so fall back to priceWithDisc
-        and then totalPrice.
-        """
+    @classmethod
+    def _sale_amount(cls, row: dict[str, Any]) -> Decimal:
+        """Amount used for bought/sales totals (keeps the previous logic)."""
         for field in ("finishedPrice", "priceWithDisc", "totalPrice"):
-            value = row.get(field)
-            if value in (None, ""):
-                continue
-            try:
-                return Decimal(str(value).replace(",", "."))
-            except (InvalidOperation, ValueError):
-                continue
+            if row.get(field) not in (None, ""):
+                return cls._decimal_field(row, field)
         return Decimal("0")
 
     async def _get_day_rows(self, kind: str, *, force: bool = False) -> list[dict[str, Any]]:
@@ -148,7 +149,10 @@ class WildberriesClient:
             self._cache[kind] = (now, rows)
             return rows
 
-    async def build_daily_report(self) -> DailyReport:
+    async def build_daily_report(self, order_sum_field: str = "finishedPrice") -> DailyReport:
+        if order_sum_field not in {"finishedPrice", "priceWithDisc", "totalPrice"}:
+            raise ValueError(f"Unsupported order sum field: {order_sum_field}")
+
         today = self._today_moscow().date()
 
         orders_rows, sales_rows = await asyncio.gather(
@@ -187,7 +191,7 @@ class WildberriesClient:
             elif warehouse_type in {"склад продавца", "seller warehouse", "seller's warehouse"}:
                 ordered_fbs += 1
 
-            ordered_sum += self._row_amount(row)
+            ordered_sum += self._decimal_field(row, order_sum_field)
             orders_by_article[article] += 1
 
         # Sales endpoint contains both sales and returns. Real sales use saleID starting with S.
@@ -208,7 +212,7 @@ class WildberriesClient:
                 continue
             sale_seen.add(unique_key)
             bought_total += 1
-            bought_sum += self._row_amount(row)
+            bought_sum += self._sale_amount(row)
 
         return DailyReport(
             ordered_total=ordered_total,
