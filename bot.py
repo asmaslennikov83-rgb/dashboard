@@ -117,8 +117,16 @@ def format_money(value: Decimal) -> str:
     return rubles + " ₽"
 
 
+def order_trend_arrow(today_qty: int, yesterday_qty: int) -> str:
+    """Treat a change of up to and including 15% of yesterday as flat."""
+    difference = today_qty - yesterday_qty
+    if abs(difference) * 100 <= yesterday_qty * 15:
+        return "🟡➡️"
+    return "🟢⬆️" if difference > 0 else "🔴⬇️"
+
+
 def format_report(cabinet_name: str, report: DailyReport) -> str:
-    now = datetime.now(MOSCOW_TZ)
+    now = report.as_of or datetime.now(MOSCOW_TZ)
     lines = [
         f"<b>Заказы за {now:%d.%m.%Y}</b>",
         f"Кабинет: <b>{html.escape(cabinet_name)}</b>",
@@ -137,7 +145,9 @@ def format_report(cabinet_name: str, report: DailyReport) -> str:
         for article, qty in sorted(
             report.orders_by_article.items(), key=lambda item: (-item[1], item[0].lower())
         ):
-            lines.append(f"{html.escape(article)} — <b>{qty}</b> шт.")
+            yesterday_qty = report.yesterday_orders_by_article.get(article, 0)
+            arrow = order_trend_arrow(qty, yesterday_qty)
+            lines.append(f"{html.escape(article)} — <b>{qty}</b> шт. {arrow}")
     else:
         lines.extend(["", "Заказов по артикулам нет."])
 

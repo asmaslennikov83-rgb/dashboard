@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
+from time import monotonic
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -31,6 +32,8 @@ class DailyReport:
     bought_total: int
     bought_sum: Decimal
     orders_by_article: dict[str, int]
+    yesterday_orders_by_article: dict[str, int] = field(default_factory=dict)
+    as_of: datetime | None = None
 
 
 class WildberriesClient:
@@ -47,7 +50,8 @@ class WildberriesClient:
         # WB limits these report methods to 1 request/minute per seller account.
         # A short cache prevents /report immediately after the scheduled run
         # from causing an unnecessary 429.
-        self._cache: dict[str, tuple[datetime, list[dict[str, Any]]]] = {}
+        self._cache: dict[tuple[str, str], tuple[datetime, list[dict[str, Any]]]] = {}
+        self._last_request: dict[str, float] = {}
         self._locks = {
             "orders": asyncio.Lock(),
             "sales": asyncio.Lock(),
@@ -96,21 +100,30 @@ class WildberriesClient:
                 return cls._decimal_field(row, field)
         return Decimal("0")
 
-    async def _get_day_rows(self, kind: str, *, force: bool = False) -> list[dict[str, Any]]:
+    async def _get_day_rows(
+        self, kind: str, *, force: bool = False,
+        as_of: datetime | None = None, yesterday: bool = False,
+    ) -> list[dict[str, Any]]:
         if kind not in {"orders", "sales"}:
             raise ValueError(f"Unsupported kind: {kind}")
 
         async with self._locks[kind]:
-            now = datetime.now(MOSCOW_TZ)
-            cached = self._cache.get(kind)
+            now = as_of or self._today_moscow()
+            day = now.date() - timedelta(days=1) if yesterday else now.date()
+            cache_key = (kind, day.isoformat())
+            cached = self._cache.get(cache_key)
             if not force and cached and now - cached[0] < timedelta(seconds=65):
                 return cached[1]
 
-            today = now.date().isoformat()
+            today = day.isoformat()
             endpoint = f"/api/v1/supplier/{kind}"
             params = {"dateFrom": today, "flag": 1}
 
             try:
+                previous = self._last_request.get(kind)
+                if previous is not None:
+                    await asyncio.sleep(max(0, 65 - (monotonic() - previous)))
+                self._last_request[kind] = monotonic()
                 response = await self._client.get(endpoint, params=params)
             except httpx.HTTPError as exc:
                 raise WildberriesAPIError(
@@ -146,32 +159,44 @@ class WildberriesClient:
                 )
 
             rows = [row for row in payload if isinstance(row, dict)]
-            self._cache[kind] = (now, rows)
+            oldest_day = (now.date() - timedelta(days=1)).isoformat()
+            self._cache = {
+                key: value for key, value in self._cache.items() if key[1] >= oldest_day
+            }
+            self._cache[cache_key] = (now, rows)
             return rows
 
     async def build_daily_report(self, order_sum_field: str = "finishedPrice") -> DailyReport:
         if order_sum_field not in {"finishedPrice", "priceWithDisc", "totalPrice"}:
             raise ValueError(f"Unsupported order sum field: {order_sum_field}")
 
-        today = self._today_moscow().date()
+        as_of = self._today_moscow()
+        today = as_of.date()
+        yesterday_cutoff = as_of - timedelta(days=1)
 
-        orders_rows, sales_rows = await asyncio.gather(
-            self._get_day_rows("orders"),
-            self._get_day_rows("sales"),
+        orders_rows, sales_rows, yesterday_rows = await asyncio.gather(
+            self._get_day_rows("orders", as_of=as_of),
+            self._get_day_rows("sales", as_of=as_of),
+            self._get_day_rows("orders", as_of=as_of, yesterday=True),
         )
 
         # Orders: count every order created today, including orders later cancelled.
         # Deduplicate by srid where available, because WB documents it as order identifier.
         order_seen: set[str] = set()
         orders_by_article: Counter[str] = Counter()
+        yesterday_orders_by_article: Counter[str] = Counter()
         ordered_total = 0
         ordered_fbo = 0
         ordered_fbs = 0
         ordered_sum = Decimal("0")
 
-        for index, row in enumerate(orders_rows):
+        for index, row in enumerate(orders_rows + yesterday_rows):
             dt = self._parse_wb_dt(str(row.get("date") or ""))
-            if dt is not None and dt.date() != today:
+            if dt is None:
+                continue
+            is_today = dt.date() == today and dt <= as_of
+            is_yesterday = dt.date() == yesterday_cutoff.date() and dt <= yesterday_cutoff
+            if not (is_today or is_yesterday):
                 continue
 
             srid = str(row.get("srid") or "").strip()
@@ -181,6 +206,9 @@ class WildberriesClient:
             order_seen.add(unique_key)
 
             article = str(row.get("supplierArticle") or "Без артикула").strip() or "Без артикула"
+            if is_yesterday:
+                yesterday_orders_by_article[article] += 1
+                continue
             ordered_total += 1
 
             # WB Statistics API returns warehouseType for the sales model:
@@ -222,4 +250,6 @@ class WildberriesClient:
             bought_total=bought_total,
             bought_sum=bought_sum,
             orders_by_article=dict(orders_by_article),
+            yesterday_orders_by_article=dict(yesterday_orders_by_article),
+            as_of=as_of,
         )
