@@ -4,7 +4,7 @@ import asyncio
 import logging
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 from time import monotonic
@@ -34,6 +34,7 @@ class DailyReport:
     orders_by_article: dict[str, int]
     yesterday_orders_by_article: dict[str, int] = field(default_factory=dict)
     as_of: datetime | None = None
+    is_final: bool = False
 
 
 class WildberriesClient:
@@ -103,13 +104,14 @@ class WildberriesClient:
     async def _get_day_rows(
         self, kind: str, *, force: bool = False,
         as_of: datetime | None = None, yesterday: bool = False,
+        day: date | None = None,
     ) -> list[dict[str, Any]]:
         if kind not in {"orders", "sales"}:
             raise ValueError(f"Unsupported kind: {kind}")
 
         async with self._locks[kind]:
             now = as_of or self._today_moscow()
-            day = now.date() - timedelta(days=1) if yesterday else now.date()
+            day = day or (now.date() - timedelta(days=1) if yesterday else now.date())
             cache_key = (kind, day.isoformat())
             cached = self._cache.get(cache_key)
             if not force and cached and now - cached[0] < timedelta(seconds=65):
@@ -159,25 +161,32 @@ class WildberriesClient:
                 )
 
             rows = [row for row in payload if isinstance(row, dict)]
-            oldest_day = (now.date() - timedelta(days=1)).isoformat()
+            oldest_day = (now.date() - timedelta(days=2)).isoformat()
             self._cache = {
                 key: value for key, value in self._cache.items() if key[1] >= oldest_day
             }
             self._cache[cache_key] = (now, rows)
             return rows
 
-    async def build_daily_report(self, order_sum_field: str = "finishedPrice") -> DailyReport:
+    async def build_daily_report(
+        self, order_sum_field: str = "finishedPrice", *,
+        yesterday: bool = False, now: datetime | None = None,
+    ) -> DailyReport:
         if order_sum_field not in {"finishedPrice", "priceWithDisc", "totalPrice"}:
             raise ValueError(f"Unsupported order sum field: {order_sum_field}")
 
-        as_of = self._today_moscow()
+        request_time = now or self._today_moscow()
+        as_of = (
+            datetime.combine(request_time.date() - timedelta(days=1), time.max, MOSCOW_TZ)
+            if yesterday else request_time
+        )
         today = as_of.date()
         yesterday_cutoff = as_of - timedelta(days=1)
 
         orders_rows, sales_rows, yesterday_rows = await asyncio.gather(
-            self._get_day_rows("orders", as_of=as_of),
-            self._get_day_rows("sales", as_of=as_of),
-            self._get_day_rows("orders", as_of=as_of, yesterday=True),
+            self._get_day_rows("orders", as_of=request_time, day=today),
+            self._get_day_rows("sales", as_of=request_time, day=today),
+            self._get_day_rows("orders", as_of=request_time, day=yesterday_cutoff.date()),
         )
 
         # Orders: count every order created today, including orders later cancelled.
@@ -228,7 +237,7 @@ class WildberriesClient:
         bought_sum = Decimal("0")
         for index, row in enumerate(sales_rows):
             dt = self._parse_wb_dt(str(row.get("date") or ""))
-            if dt is not None and dt.date() != today:
+            if dt is None or dt.date() != today:
                 continue
 
             sale_id = str(row.get("saleID") or "").strip()
@@ -252,4 +261,5 @@ class WildberriesClient:
             orders_by_article=dict(orders_by_article),
             yesterday_orders_by_article=dict(yesterday_orders_by_article),
             as_of=as_of,
+            is_final=yesterday,
         )

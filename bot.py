@@ -128,7 +128,7 @@ def order_trend_arrow(today_qty: int, yesterday_qty: int) -> str:
 def format_report(cabinet_name: str, report: DailyReport) -> str:
     now = report.as_of or datetime.now(MOSCOW_TZ)
     lines = [
-        f"<b>Заказы за {now:%d.%m.%Y}</b>",
+        f"<b>{'Итоговый отчёт за' if report.is_final else 'Заказы за'} {now:%d.%m.%Y}</b>",
         f"Кабинет: <b>{html.escape(cabinet_name)}</b>",
         "",
         "",
@@ -228,6 +228,7 @@ async def send_all_reports(
     *,
     force: bool = False,
     recipient_ids: list[int] | None = None,
+    yesterday: bool = False,
 ) -> None:
     """Send one independent message per WB cabinet to each recipient."""
     if not force and not is_within_activity_window():
@@ -242,10 +243,16 @@ async def send_all_reports(
 
     # Automatic reports go to every user in the Telegram whitelist.
     targets = recipient_ids if recipient_ids is not None else sorted(TELEGRAM_ALLOWED_USER_IDS)
+    report_time = datetime.now(MOSCOW_TZ)
 
     for cabinet in CABINETS:
         try:
-            report = await cabinet.build_daily_report(str(SETTINGS["order_sum_field"]))
+            if yesterday:
+                report = await cabinet.build_daily_report(
+                    str(SETTINGS["order_sum_field"]), yesterday=True, now=report_time
+                )
+            else:
+                report = await cabinet.build_daily_report(str(SETTINGS["order_sum_field"]))
             text = format_report(cabinet.name, report)
         except WildberriesAPIError as exc:
             log.exception("WB API error for cabinet %s", cabinet.name)
@@ -302,6 +309,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Бот активен.\n\n"
         "Каждый час он отправляет накопительный отчёт за текущие сутки по двум кабинетам.\n"
         "/report — получить отчёт вручную.\n"
+        "/yesterday — итоговый отчёт за вчера.\n"
         "/activity — настроить время автоматической отправки по Москве.\n"
         "/sumprice — выбрать способ расчёта суммы заказов."
     )
@@ -316,6 +324,19 @@ async def report_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.application,
         force=True,
         recipient_ids=[update.effective_chat.id],
+    )
+
+
+async def yesterday_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update):
+        await deny_access(update)
+        return
+    await update.effective_message.reply_text("Формирую итоговый отчёт за вчера по Москве…")
+    await send_all_reports(
+        context.application,
+        force=True,
+        recipient_ids=[update.effective_chat.id],
+        yesterday=True,
     )
 
 
@@ -422,6 +443,7 @@ async def post_init(application: Application) -> None:
     await application.bot.set_my_commands(
         [
             BotCommand("report", "Отчёт за текущие сутки"),
+            BotCommand("yesterday", "Итоговый отчет за вчера"),
             BotCommand("activity", "Время активности отчётов"),
             BotCommand("sumprice", "Расчёт суммы заказов"),
             BotCommand("start", "Справка"),
@@ -466,6 +488,7 @@ def main() -> None:
     )
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("report", report_command))
+    application.add_handler(CommandHandler("yesterday", yesterday_command))
     application.add_handler(CommandHandler("activity", activity_command))
     application.add_handler(CommandHandler("sumprice", sumprice_command))
     application.add_handler(CallbackQueryHandler(activity_callback, pattern=r"^activity:"))
