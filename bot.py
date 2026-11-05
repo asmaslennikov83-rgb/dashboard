@@ -19,7 +19,7 @@ from telegram.ext import Application, CallbackQueryHandler, CommandHandler, Cont
 from wb_client import DailyReport, WildberriesAPIError, WildberriesClient
 from cart_export import CartExporter, PERIODS, make_xlsx, period_dates
 
-BUILD_VERSION = "2026.11.05.1"
+BUILD_VERSION = "2026.11.05.2"
 
 
 load_dotenv()
@@ -107,26 +107,44 @@ async def cart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def deliver_cart_export(application, chat_id, user_id, cabinet_index, days, start, end):
+    stage = "получение данных WB"
     try:
         rows = await CART_EXPORTERS[cabinet_index].rows(start, end)
         if not rows:
             await application.bot.send_message(chat_id=chat_id, text="За выбранный период WB не вернул товары.")
             return
+        stage = "формирование Excel"
         document = await asyncio.to_thread(make_xlsx, rows, CABINETS[cabinet_index].name, start, end)
         try:
+            stage = "отправка Excel в Telegram"
             await application.bot.send_document(
                 chat_id=chat_id, document=document,
                 filename=f"cart_cabinet_{cabinet_index+1}_{start}_{end}.xlsx",
                 caption=f"{CABINETS[cabinet_index].name}\n{start:%d.%m.%Y} — {end:%d.%m.%Y}\n"
                         "Одна строка на товар, все ШК в одной ячейке. Показатели из воронки продаж WB.",
+                read_timeout=120, write_timeout=120, connect_timeout=30, pool_timeout=30,
             )
         finally:
             document.close()
     except WildberriesAPIError as exc:
         await application.bot.send_message(chat_id=chat_id, text=str(exc))
-    except Exception:
+    except Exception as exc:
         log.exception("Cart export failed for cabinet %s", cabinet_index + 1)
-        await application.bot.send_message(chat_id=chat_id, text="Не удалось сформировать или отправить выгрузку. Попробуйте позже.")
+        from telegram.error import TimedOut, NetworkError, BadRequest
+        if isinstance(exc, TimedOut):
+            reason = "истекло время ожидания Telegram. Проверьте, не пришёл ли файл, и повторите запрос позже"
+        elif isinstance(exc, BadRequest):
+            reason = str(exc)[:300]
+        elif isinstance(exc, NetworkError):
+            reason = "ошибка соединения с Telegram"
+        elif isinstance(exc, ValueError) and stage == "формирование Excel":
+            reason = str(exc)[:300]
+        else:
+            reason = f"неожиданная ошибка {type(exc).__name__}; подробности в журнале бота"
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=f"Кабинет: {CABINETS[cabinet_index].name}\nЭтап: {stage}\nПричина: {reason}\nСборка: {BUILD_VERSION}",
+        )
     finally:
         application.bot_data.setdefault("cart_busy", set()).discard(user_id)
 

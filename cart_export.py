@@ -63,7 +63,8 @@ class CartExporter:
                     "skipDeletedNm": False, "orderBy": {"field": "orderCount", "mode": "desc"},
                     "limit": 1000, "offset": offset,
                 })
-                page = payload.get("data", {}).get("products")
+                data = payload.get("data")
+                page = data.get("products") if isinstance(data, dict) else None
                 if not isinstance(page, list):
                     raise WildberriesAPIError("В ответе WB отсутствует список товаров.")
                 added = 0
@@ -98,13 +99,28 @@ class CartExporter:
                 if not isinstance(cards, list):
                     raise WildberriesAPIError("В ответе WB отсутствует список карточек.")
                 for card in cards:
-                    nm = int(card["nmID"])
+                    if not isinstance(card, dict):
+                        raise WildberriesAPIError("WB Контент: карточка имеет неожиданный формат.")
+                    try:
+                        nm = int(card["nmID"])
+                    except (KeyError, ValueError, TypeError) as exc:
+                        raise WildberriesAPIError("WB Контент: у карточки отсутствует корректный nmID.") from exc
                     codes = barcodes.setdefault(nm, set())
-                    for size in card.get("sizes", []):
-                        codes.update(str(code) for code in size.get("skus", []) if code)
-                next_cursor = payload.get("cursor", {})
+                    sizes = card.get("sizes") or []
+                    if not isinstance(sizes, list):
+                        raise WildberriesAPIError(f"WB Контент: некорректные размеры карточки {nm}.")
+                    for size in sizes:
+                        if not isinstance(size, dict):
+                            raise WildberriesAPIError(f"WB Контент: некорректный размер карточки {nm}.")
+                        skus = size.get("skus") or []
+                        if not isinstance(skus, list):
+                            raise WildberriesAPIError(f"WB Контент: некорректные ШК карточки {nm}.")
+                        codes.update(str(code) for code in skus if code)
+                next_cursor = payload.get("cursor") or {}
                 if len(cards) < 100:
                     break
+                if not isinstance(next_cursor, dict):
+                    raise WildberriesAPIError("WB Контент: некорректный формат курсора.")
                 key = (next_cursor.get("updatedAt"), next_cursor.get("nmID"))
                 if not all(key) or key in seen:
                     raise WildberriesAPIError("Некорректный курсор карточек WB.")
