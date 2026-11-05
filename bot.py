@@ -17,6 +17,9 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from wb_client import DailyReport, WildberriesAPIError, WildberriesClient
+from cart_export import CartExporter, PERIODS, make_xlsx, period_dates
+
+BUILD_VERSION = "2026.11.05.1"
 
 
 load_dotenv()
@@ -70,6 +73,111 @@ CABINETS = [
     WildberriesClient(required_env("WB_TOKEN_1"), required_env("WB_NAME_1")),
     WildberriesClient(required_env("WB_TOKEN_2"), required_env("WB_NAME_2")),
 ]
+CART_EXPORTERS = [
+    CartExporter(
+        os.getenv(f"WB_ANALYTICS_TOKEN_{i}", "").strip() or cabinet.token,
+        os.getenv(f"WB_CONTENT_TOKEN_{i}", "").strip() or cabinet.token,
+    )
+    for i, cabinet in enumerate(CABINETS, 1)
+]
+
+
+def main_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Выгрузить добавили в корзину", callback_data="cart:open")],
+        [InlineKeyboardButton(f"Версия сборки: {BUILD_VERSION}", callback_data="cart:version")],
+    ])
+
+
+def cart_period_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, callback_data=f"cart:period:{days}")]
+        for days, label in PERIODS.items()
+    ])
+
+
+async def cart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update):
+        await deny_access(update)
+        return
+    await update.effective_message.reply_text(
+        "Выберите период: месяц — 30 полных дней. Все периоды по вчера включительно, по Москве.",
+        reply_markup=cart_period_menu(),
+    )
+
+
+async def deliver_cart_export(application, chat_id, user_id, cabinet_index, days, start, end):
+    try:
+        rows = await CART_EXPORTERS[cabinet_index].rows(start, end)
+        if not rows:
+            await application.bot.send_message(chat_id=chat_id, text="За выбранный период WB не вернул товары.")
+            return
+        document = await asyncio.to_thread(make_xlsx, rows, CABINETS[cabinet_index].name, start, end)
+        try:
+            await application.bot.send_document(
+                chat_id=chat_id, document=document,
+                filename=f"cart_cabinet_{cabinet_index+1}_{start}_{end}.xlsx",
+                caption=f"{CABINETS[cabinet_index].name}\n{start:%d.%m.%Y} — {end:%d.%m.%Y}\n"
+                        "Одна строка на товар, все ШК в одной ячейке. Показатели из воронки продаж WB.",
+            )
+        finally:
+            document.close()
+    except WildberriesAPIError as exc:
+        await application.bot.send_message(chat_id=chat_id, text=str(exc))
+    except Exception:
+        log.exception("Cart export failed for cabinet %s", cabinet_index + 1)
+        await application.bot.send_message(chat_id=chat_id, text="Не удалось сформировать или отправить выгрузку. Попробуйте позже.")
+    finally:
+        application.bot_data.setdefault("cart_busy", set()).discard(user_id)
+
+
+async def cart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update):
+        await deny_access(update)
+        return
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    if data == "cart:version":
+        await query.message.reply_text(f"Версия сборки: {BUILD_VERSION}")
+        return
+    if data == "cart:open":
+        await query.edit_message_text("Выберите период (полные дни по вчера включительно, Москва):", reply_markup=cart_period_menu())
+        return
+    parts = data.split(":")
+    try:
+        if len(parts) == 3 and parts[1] == "period":
+            days = int(parts[2])
+            if days not in PERIODS:
+                return
+            await query.edit_message_text(
+                f"Период: {PERIODS[days]}. Выберите кабинет:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(cabinet.name, callback_data=f"cart:cabinet:{days}:{i}")]
+                    for i, cabinet in enumerate(CABINETS)
+                ] + [[InlineKeyboardButton("Назад к периодам", callback_data="cart:open")]]),
+            )
+        elif len(parts) == 4 and parts[1] == "cabinet":
+            days, index = int(parts[2]), int(parts[3])
+            if days not in PERIODS or not 0 <= index < len(CABINETS):
+                return
+            busy = context.application.bot_data.setdefault("cart_busy", set())
+            user_id = update.effective_user.id
+            if user_id in busy or CART_EXPORTERS[index].lock.locked():
+                await query.message.reply_text("Выгрузка уже формируется. Дождитесь завершения и повторите запрос.")
+                return
+            start, end = period_dates(days)
+            busy.add(user_id)
+            try:
+                await query.message.reply_text(f"Формирую Excel: {CABINETS[index].name}, {start:%d.%m.%Y} — {end:%d.%m.%Y}.")
+                context.application.create_task(deliver_cart_export(
+                    context.application, update.effective_chat.id, user_id, index, days, start, end
+                ), update=update)
+            except Exception:
+                busy.discard(user_id)
+                raise
+    except ValueError:
+        return
 
 
 def load_settings() -> dict[str, int | str]:
@@ -311,7 +419,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/report — получить отчёт вручную.\n"
         "/yesterday — итоговый отчёт за вчера.\n"
         "/activity — настроить время автоматической отправки по Москве.\n"
-        "/sumprice — выбрать способ расчёта суммы заказов."
+        "/sumprice — выбрать способ расчёта суммы заказов.\n"
+        "/cart — выгрузить добавили в корзину.\n"
+        f"Версия сборки: {BUILD_VERSION}",
+        reply_markup=main_menu(),
     )
 
 
@@ -444,6 +555,8 @@ async def post_init(application: Application) -> None:
         [
             BotCommand("report", "Отчёт за текущие сутки"),
             BotCommand("yesterday", "Итоговый отчет за вчера"),
+            BotCommand("cart", "Выгрузить добавили в корзину"),
+            BotCommand("menu", f"Главное меню · {BUILD_VERSION}"),
             BotCommand("activity", "Время активности отчётов"),
             BotCommand("sumprice", "Расчёт суммы заказов"),
             BotCommand("start", "Справка"),
@@ -487,6 +600,9 @@ def main() -> None:
         .build()
     )
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("menu", start_command))
+    application.add_handler(CommandHandler("cart", cart_command))
+    application.add_handler(CallbackQueryHandler(cart_callback, pattern=r"^cart:"))
     application.add_handler(CommandHandler("report", report_command))
     application.add_handler(CommandHandler("yesterday", yesterday_command))
     application.add_handler(CommandHandler("activity", activity_command))
